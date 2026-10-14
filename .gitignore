@@ -1,0 +1,15 @@
+# local, never committed or bundled
+quotes_local.py
+*.backup*.py
+main_candidate*.py
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.spec
+*.zip
+*.log
+.env
+shots/

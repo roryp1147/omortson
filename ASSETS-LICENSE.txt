@@ -1,0 +1,9 @@
+Art and sound assets
+
+The MIT license in LICENSE covers the source code only. The icon and the
+sounds in sounds/ are (c) 2026 Rory and are free for personal use only. They
+may not be redistributed or resold, on their own or as part of another
+product, without permission.
+
+Omortson is an independent personal project and is not affiliated with any
+company. AMD and Radeon are trademarks of Advanced Micro Devices, Inc.
