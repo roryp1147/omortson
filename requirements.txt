@@ -1,5 +1,6 @@
 # Omortson runtime (Windows 10/11, Python 3.14)
 PySide6==6.11.*
 psutil>=6
-# AMD GPU telemetry (GPU load / temperature / VRAM gauges)
+# GPU telemetry: AMD via ADLX, NVIDIA via NVML; other GPUs use Windows counters (no extra package)
 amd-adlx>=1.0.3; sys_platform == "win32"
+nvidia-ml-py>=12; sys_platform == "win32"

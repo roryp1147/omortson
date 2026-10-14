@@ -6,11 +6,19 @@ A retro-industrial CRT system monitor for Windows. Four analog gauges show CPU l
 
 ## Download
 
-**[Download Omortson for Windows (v1.0.0)](https://github.com/roryp1147/omortson/releases/latest/download/Omortson-1.0.0-win64.zip)** · [Project page](https://roryp1147.github.io/projects/omortson.html)
+**[Download Omortson for Windows (v1.0.1)](https://github.com/roryp1147/omortson/releases/latest/download/Omortson-1.0.1-win64.zip)** · [Project page](https://roryp1147.github.io/projects/omortson.html)
 
 Windows 10/11 (64-bit). No Python required: extract the zip and run `Omortson.exe`. The app isn't code-signed, so SmartScreen may warn you; click **More info → Run anyway**.
 
-**GPU gauges need an AMD Radeon GPU.** GPU load, temperature and VRAM are read through AMD's ADLX library. On NVIDIA or Intel graphics the CPU, memory, disk and network readouts still work, but the GPU gauges show no signal.
+**GPU support:** the GPU is detected at startup.
+
+| GPU | Load | Temperature | VRAM | Source |
+|---|---|---|---|---|
+| AMD Radeon | yes | yes | yes | AMD ADLX |
+| NVIDIA GeForce/RTX | yes | yes | yes | NVML (installed with the NVIDIA driver) |
+| Intel or other | yes | N/A | yes | Windows GPU performance counters |
+
+You can force a backend with `OMORTSON_GPU_BACKEND=adlx`, `nvml`, `pdh` or `none`.
 
 ## Run from source
 

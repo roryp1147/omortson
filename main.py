@@ -2138,9 +2138,10 @@ class BootSequence(QObject):
         except Exception:
             cores = "UNAVAILABLE"
 
-        adlx = "ESTABLISHED" if m.performance is not None else "UNAVAILABLE"
+        link = getattr(m, "gpu_link", "")
+        adlx = f"{link} ESTABLISHED" if link else "UNAVAILABLE"
 
-        thermal = "1 ONLINE" if m.performance is not None else "NO SIGNAL"
+        thermal = "1 ONLINE" if (m.performance is not None or link == "NVML") else "N/A"
 
         return [
             "OMORTSON CORE 6100  //  SYSTEM MONITOR",
@@ -2150,7 +2151,7 @@ class BootSequence(QObject):
             row("PROCESSOR", get_cpu_name().upper()[:42]),
             row("CORES / THREADS", cores),
             row("SENSOR BUS", "OK"),
-            row("ADLX LINK", adlx),
+            row("GPU LINK", adlx),
             row("GRAPHICS", str(m.gpu_name).upper()[:42]),
             row("THERMAL PROBES", thermal),
             row("HOST", platform.node().upper()),
@@ -2302,6 +2303,201 @@ class BootSequence(QObject):
 # ============================================================
 # WINDOWS GPU MONITOR
 # ============================================================
+
+# ------------------------------------------------------------
+# GPU BACKENDS (non-AMD): NVIDIA via NVML, anything else via PDH
+# ------------------------------------------------------------
+# AMD keeps the ADLX path in OmortsonMonitor. These backends all expose
+#     name, total_vram (MB), label, sample() -> (usage %, temp C or None, vram MB)
+# and never raise. Force one with OMORTSON_GPU_BACKEND=adlx|nvml|pdh|none.
+
+class NvmlGPUBackend:
+
+    label = "NVML"
+
+    def __init__(self):
+
+        import pynvml                       # nvidia-ml-py
+        self.nv = pynvml
+        pynvml.nvmlInit()
+        if pynvml.nvmlDeviceGetCount() < 1:
+            raise RuntimeError("no NVIDIA GPU")
+        self.h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        name = pynvml.nvmlDeviceGetName(self.h)
+        self.name = name.decode() if isinstance(name, bytes) else str(name)
+        try:
+            self.total_vram = int(pynvml.nvmlDeviceGetMemoryInfo(self.h).total // (1024 * 1024))
+        except Exception:
+            self.total_vram = 0
+
+    def sample(self):
+
+        nv, usage, temp, vram = self.nv, 0.0, None, 0
+        try:
+            usage = float(nv.nvmlDeviceGetUtilizationRates(self.h).gpu)
+        except Exception:
+            pass
+        try:
+            temp = float(nv.nvmlDeviceGetTemperature(self.h, nv.NVML_TEMPERATURE_GPU))
+        except Exception:
+            temp = None
+        try:
+            vram = int(nv.nvmlDeviceGetMemoryInfo(self.h).used // (1024 * 1024))
+        except Exception:
+            pass
+        return usage, temp, vram
+
+    def close(self):
+
+        try:
+            self.nv.nvmlShutdown()
+        except Exception:
+            pass
+
+
+class PdhGPUBackend:
+
+    """Windows GPU performance counters (what Task Manager uses), via pdh.dll
+    and ctypes: usage = busiest engine type, memory = dedicated usage.
+    No temperature (shown as N/A)."""
+
+    label = "WDDM COUNTERS"
+
+    PDH_FMT_DOUBLE = 0x00000200
+    PDH_FMT_NOCAP100 = 0x00008000
+    PDH_MORE_DATA = 0x800007D2
+
+    def __init__(self):
+
+        import ctypes
+        from ctypes import wintypes
+
+        self.ct = ctypes
+        self.pdh = ctypes.WinDLL("pdh.dll")
+
+        class FmtValue(ctypes.Structure):
+            _fields_ = [("CStatus", wintypes.DWORD), ("doubleValue", ctypes.c_double)]
+
+        class Item(ctypes.Structure):
+            _fields_ = [("szName", wintypes.LPWSTR), ("FmtValue", FmtValue)]
+
+        self.Item = Item
+        self.query = wintypes.HANDLE()
+        if self.pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.query)) != 0:
+            raise RuntimeError("PdhOpenQuery failed")
+
+        def add(path):
+            h = wintypes.HANDLE()
+            st = self.pdh.PdhAddEnglishCounterW(self.query, ctypes.c_wchar_p(path), 0, ctypes.byref(h))
+            return h if st == 0 else None
+
+        self.c_engine = add(r"\GPU Engine(*)\Utilization Percentage")
+        self.c_mem = add(r"\GPU Adapter Memory(*)\Dedicated Usage")
+        if self.c_engine is None:
+            raise RuntimeError("GPU Engine counters unavailable")
+
+        self.pdh.PdhCollectQueryData(self.query)          # rate counters need two samples
+        self.name, self.total_vram = self._adapter_info()
+
+    def _array(self, counter):
+
+        ct = self.ct
+        size = ct.c_ulong(0)
+        count = ct.c_ulong(0)
+        fmt = self.PDH_FMT_DOUBLE | self.PDH_FMT_NOCAP100
+        st = self.pdh.PdhGetFormattedCounterArrayW(counter, fmt, ct.byref(size), ct.byref(count), None)
+        if (st & 0xFFFFFFFF) != self.PDH_MORE_DATA or size.value == 0:
+            return []
+        buf = (ct.c_byte * size.value)()
+        st = self.pdh.PdhGetFormattedCounterArrayW(counter, fmt, ct.byref(size), ct.byref(count), buf)
+        if st != 0:
+            return []
+        items = ct.cast(buf, ct.POINTER(self.Item))
+        out = []
+        for i in range(count.value):
+            it = items[i]
+            if it.FmtValue.CStatus in (0, 1):             # PDH_CSTATUS_VALID_DATA / NEW_DATA
+                out.append((it.szName or "", it.FmtValue.doubleValue))
+        return out
+
+    def _adapter_info(self):
+
+        name, total = "GPU", 0
+        try:
+            import winreg
+            base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as k:
+                best = None
+                for i in range(64):
+                    try:
+                        sub = winreg.EnumKey(k, i)
+                    except OSError:
+                        break
+                    if not sub.isdigit():
+                        continue
+                    try:
+                        with winreg.OpenKey(k, sub) as s:
+                            desc = str(winreg.QueryValueEx(s, "DriverDesc")[0])
+                            try:
+                                mem = winreg.QueryValueEx(s, "HardwareInformation.qwMemorySize")[0]
+                            except OSError:
+                                mem = winreg.QueryValueEx(s, "HardwareInformation.MemorySize")[0]
+                            if isinstance(mem, bytes):
+                                mem = int.from_bytes(mem[:8], "little")
+                            mem = int(mem)
+                    except OSError:
+                        continue
+                    if "basic" in desc.lower() or "remote" in desc.lower():
+                        continue
+                    if best is None or mem > best[1]:
+                        best = (desc, mem)
+                if best:
+                    name, total = best[0], best[1] // (1024 * 1024)
+        except Exception:
+            pass
+        return name, total
+
+    def sample(self):
+
+        usage, vram = 0.0, 0
+        try:
+            self.pdh.PdhCollectQueryData(self.query)
+            per = {}
+            for inst, v in self._array(self.c_engine):
+                i = inst.rfind("engtype_")
+                key = (inst[inst.find("luid_"):inst.find("_phys")] if "luid_" in inst else "", inst[i + 8:] if i >= 0 else inst)
+                per[key] = per.get(key, 0.0) + v
+            if per:
+                usage = max(0.0, min(100.0, max(per.values())))
+            if self.c_mem is not None:
+                mem = [v for _, v in self._array(self.c_mem)]
+                if mem:
+                    vram = int(max(mem) // (1024 * 1024))
+        except Exception:
+            pass
+        return usage, None, vram
+
+    def close(self):
+
+        try:
+            self.pdh.PdhCloseQuery(self.query)
+        except Exception:
+            pass
+
+
+def open_gpu_backend(forced=""):
+
+    """First working non-AMD backend (or None). Never raises."""
+
+    order = {"nvml": (NvmlGPUBackend,), "pdh": (PdhGPUBackend,), "none": ()}.get(
+        forced, (NvmlGPUBackend, PdhGPUBackend))
+    for cls in order:
+        try:
+            return cls()
+        except Exception:
+            continue
+    return None
+
 
 class WindowsGPUMonitor(QThread):
 
@@ -8113,8 +8309,13 @@ class OmortsonMonitor(QWidget):
         self.adlx_system = None
         self.gpu = None
         self.performance = None
+        self.gpu_backend = None
+        gpu_forced = os.environ.get("OMORTSON_GPU_BACKEND", "").strip().lower()
 
         try:
+
+            if gpu_forced not in ("", "adlx"):
+                raise RuntimeError("ADLX skipped by OMORTSON_GPU_BACKEND")
 
             from adlx import ADLX
 
@@ -8159,6 +8360,15 @@ class OmortsonMonitor(QWidget):
 
         self.gpu_name = "GPU NOT DETECTED"
         self.gpu_total_vram = 0
+
+        if self.performance is None and gpu_forced != "adlx":
+            self.gpu_backend = open_gpu_backend(gpu_forced)
+            if self.gpu_backend is not None:
+                self.gpu_name = self.gpu_backend.name or "GPU"
+                self.gpu_total_vram = int(self.gpu_backend.total_vram or 0)
+
+        self.gpu_link = "ADLX" if self.performance is not None else (
+            self.gpu_backend.label if self.gpu_backend is not None else "")
 
         if self.gpu is not None:
 
@@ -8344,19 +8554,7 @@ class OmortsonMonitor(QWidget):
 
         self.gpu_monitor = None
 
-        if self.performance is None:
-
-            # Fallback only: spawning PowerShell is slow (~1.5 s per sample)
-
-            self.gpu_monitor = (
-                WindowsGPUMonitor()
-            )
-
-            self.gpu_monitor.usage_updated.connect(
-                self.receive_gpu_usage
-            )
-
-            self.gpu_monitor.start()
+        # (non-AMD GPUs are read in-process by self.gpu_backend; no PowerShell)
 
         # ----------------------------------------------------
         # SPEED BASELINES
@@ -9920,6 +10118,24 @@ class OmortsonMonitor(QWidget):
 
         gpu_temp = 0.0
         gpu_vram = 0
+        gpu_temp_na = False
+
+        if self.performance is None and self.gpu_backend is not None:
+
+            try:
+                u, t, v = self.gpu_backend.sample()
+                self.gpu_usage = float(u)
+                gpu_vram = int(v)
+                if t is None:
+                    gpu_temp_na = True
+                else:
+                    gpu_temp = float(t)
+            except Exception:
+                pass
+
+        elif self.performance is None:
+
+            gpu_temp_na = True
 
         if self.performance is not None:
 
@@ -9991,7 +10207,7 @@ class OmortsonMonitor(QWidget):
         # ----------------------------------------------------
 
         self.info_panel.temp_button.set_value(
-            f"{gpu_temp:.1f} °C"
+            "N/A" if gpu_temp_na else f"{gpu_temp:.1f} °C"
         )
 
         # ----------------------------------------------------
@@ -10210,6 +10426,12 @@ class OmortsonMonitor(QWidget):
         self.performance = None
         self.gpu = None
         self.adlx_system = None
+
+        try:
+            if self.gpu_backend is not None:
+                self.gpu_backend.close()
+        except Exception:
+            pass
 
         try:
 
